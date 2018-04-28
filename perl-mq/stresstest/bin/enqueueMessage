@@ -1,0 +1,300 @@
+#!/usr/local/bin/perl
+# enqueueMessage - enqueue the email messages to MQ Queue
+# for the stress test
+use strict;
+use warnings;
+use Data::Dumper;
+
+# Perl Libraries
+use MQSeries;
+use MQSeries::QueueManager;
+use MQSeries::Queue;
+use MQSeries::Message;
+use Getopt::Long;
+
+use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use WMCOM::log;
+use WMMQ::Param qw(loadEnv loadConf);
+use CEProcUtil  qw(pspid);
+use WMMQ::Comm;
+
+my $param = loadEnv();
+my ($istest, $runlevel) = (1, 'DEV');
+
+###################
+## Program Start ##
+###################
+# Open log file and print the current operation
+my $log_warning = 0;
+my ($log_email_from, $log_email_subject, $log_filename, $logdir) = &get_program_log_param;
+my $program_log = WMCOM::log->new(
+    emailfrom => $log_email_from,
+    emailsubj => $log_email_subject,
+    emailto   => $param->{debug_email},
+    filename  => $log_filename,
+    filedir   => $logdir,
+    debug     => 0
+);
+
+my $opt = get_options();
+my $debug = $opt->{debug} if exists $opt->{debug};
+my @oparr = @{$opt->{operation}} if exists $opt->{operation};
+my $conf;
+if (exists $opt->{file}) {
+    $conf = loadConf($opt->{file});
+    die "Can not load configuration file!" unless $conf;
+    # merge with more config info
+    if (exists $conf->{mq}) {
+        $param->{mq} = $conf->{mq};
+    }
+    if (exists $conf->{config}) {
+        $param->{config} = $conf->{config};
+    }
+}
+
+# Check the MQ connection
+WMMQ::Comm->checkMQ($param->{mq})
+|| $program_log->exit(1, "WM::ERR::Unable to connect to queue manager at the beginning:\nConf - ".Dumper($param->{mq}));
+
+$program_log->write("Running as $runlevel on ".$param->{user}."@".$param->{hostname});
+
+my %child;
+if (exists $param->{config}) {
+    my $rhop = $param->{config}->{operation};
+    my $rhde = $param->{config}->{default};
+    for my $op (@{$param->{mq}->{queue}}) {
+        if (exists $rhop->{$op}) {
+            $child{$op} = $rhop->{$op};
+        } else {
+            $child{$op} = $rhde;
+        }
+    }
+} else {
+    my $mail_content = "wm_mail/template/mail_content";
+    for my $op (@oparr) {
+        $child{$op} = {
+            file    => { length => 0, content => $mail_content },
+            count   => $param->{enqueueMsgThreshold},
+            thread  => 1,
+            persec  => 0,
+            enable  => 'Y',
+            isatest => '?',
+        };
+    }
+}
+
+# This signal handler will be applied for
+# both parent and child process
+my $stop_flag = 0;
+$SIG{INT} = $SIG{TERM} = sub { $program_log->write("Watchdog received stop command"); $stop_flag = 1 };
+
+# fork worker
+my $PPID = $$;
+my %proc;
+for my $op (keys %child) {
+    my $v = $child{$op};
+    next if $v->{enable} ne 'Y';
+    my $taskcnt = int($v->{count}/$v->{thread});
+    for (1..$v->{thread}) {
+        my $pid = fork();
+        die "fork failed:$!" unless defined $pid;
+        if ($pid == 0) {
+            # BEGIN WORKER
+            # set instruction
+            local $SIG{INT}  = sub {};
+            local $SIG{TERM} = sub { $program_log->write("Worker received stop command"); $stop_flag = 1 };
+            # specify goal
+            $v->{thread} = 1;
+            $v->{count}  = $taskcnt;
+            my $msgcnt = enqueueWorker($op,$param->{mq},$v);
+            $program_log->write("Worker has completed $msgcnt emails");
+            exit 0;
+            # END WORKER
+        } else {
+            $proc{$pid} = {
+                task => $op,
+                taskcnt => $taskcnt,
+                is_running => 1,
+            };
+        }
+    }
+}
+
+# wait until workers done 
+my $interval = 5;
+while (1) {
+    # WORKERS MUST EXIST FIRST
+    last if !grep { $_->{is_running} } values %proc;
+    
+    # monitor process
+    #print Dumper \%proc;
+    my $ps = pspid(keys %proc);
+    #print Dumper $ps;
+    for my $pid (keys %proc) {
+        if (not exists $ps->{$pid}) {
+            $proc{$pid}{is_running} = 0;
+            next;
+        }
+        if ($ps->{$pid}->{ppid} == $PPID and $ps->{$pid}->{cmd} =~ m{enqueueMessage}) {
+            $proc{$pid}{is_running} = 1;
+        } else {
+            $proc{$pid}{is_running} = 0;
+        }
+    }
+
+    # display process
+    print "== Watchdog $PPID reporting ==\n";
+    workingStatus(\%proc);
+    
+    if ($stop_flag) {
+        print "Stoping the workers...\n";
+        $interval = 1;
+        for my $taskid (grep { $proc{$_}{is_running} } keys %proc) {
+            kill("TERM", $taskid);
+        }
+    }
+    sleep $interval;
+}
+
+print "Watchdog confirmed done!\n";
+
+$program_log->exit($log_warning);
+
+####################
+## End of Program ##
+####################
+
+sub workingStatus {
+    my $proc = shift;
+    print '+'.('-'x45).'+',"\n";
+    printf("| %-6s | %-12s | %-6s | %10s |\n", "TaskId", "Task", "Goal", "Status");
+    for my $taskid (sort {$a <=> $b} keys %$proc) {
+        printf("| %-6i | %-12s | %-6i | %10s |\n", $taskid, $proc{$taskid}{task}, $proc{$taskid}{taskcnt}, 
+                                                  ($proc{$taskid}{is_running} ? "Running" : "Completed"));
+    }
+    print '+'.('-'x45).'+',"\n";
+}
+
+sub enqueueWorker {
+    my ($operation, $rhmq, $rhop) = @_;
+    my $totalCnt = $rhop->{count};
+    my $batchCnt = $rhop->{persec};
+    my $filename = $rhop->{file}{content};
+
+    my $mq = WMMQ::Comm->new(conf => $rhmq, log => $program_log);
+    $operation = lc($operation);
+    my $msgQueueName = uc($operation);
+    my $msgqueue = "BEDROCK.DMZ.".$msgQueueName.".MAIL";
+    my $emailMessage = prepareEmailMessage($filename);
+
+    # single batch enqueue method
+    if ($batchCnt == 0 or $batchCnt >= $totalCnt ) {
+        $mq->enqueueMailMessage($operation, $msgqueue, $emailMessage, $totalCnt);
+        return $totalCnt;
+    }
+
+    # multiple batch enqueue method
+    my $currCnt = 0;
+    while (1) {
+        if ($currCnt + $batchCnt > $totalCnt) {
+            $batchCnt = $totalCnt - $currCnt;
+        }
+        last if $stop_flag or $currCnt >= $totalCnt;
+        $mq->enqueueMailMessage($operation, $msgqueue, $emailMessage, $batchCnt);
+        $currCnt += $batchCnt;
+        sleep 1;
+    }
+    return $currCnt;
+}
+
+sub prepareEmailMessage {
+    my $mail_content = shift;
+    $mail_content = $param->{homedir}.$mail_content;
+    open(my $fh, $mail_content) or $program_log->exit(1, "($$)WM::ERR:: Unable to open the mail content:$mail_content");
+    my $message = do { local $/; <$fh> };
+    close($fh);
+    return $message;
+}
+
+sub get_program_log_param{
+    my $log_email_from = "stressTest\@batch.walmart.com (stressTest Batch Job)";
+    $log_email_from =~ s/Batch Job/Test Batch Job/ if ($istest);
+
+    my $log_email_subject = "Email StressTest Errors Detected\n\n";
+
+    my $pid = $$;
+    my ($lower, $upper) = (1000, 200000);
+    my $random = int(rand( $upper-$lower+1 ) ) + $lower;
+    $random = sprintf("%06d", $random);
+    my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime();
+    my $prefix = sprintf("%04d%02d%02d_%02d%02d%02d",$year+1900,$mon+1,$mday,$hour,$min,$sec);
+    my $log_filename = "enqueueMessage_".$pid."_".$prefix."_".$random.".log";
+
+    my $logdir  = $param->{homedir}."/logs/stressTest/";
+
+    return ($log_email_from, $log_email_subject, $log_filename, $logdir);
+}
+
+=head1 NAME
+Email Stress Test Program 
+
+enqueueMessage - for helping enqueue message into MQ queue
+
+=head1 SYNOPSIS
+
+Usage: enqueueMessage [options]
+  -h, --help            Display this help page.
+  -d, --debug           debug level for this script
+  -o, --operation       email operation, associated with MQ queue
+  -f, --file            configuration file for one stress test
+
+* Currently there're 19 email operations:
+  cancellation
+  creditcard
+  giftregistry
+  miscoms
+  miscomsff
+  optical
+  orderconfirm
+  pharmacy
+  photo
+  shopcard
+  shipconfirm
+  sitetostore
+  tires
+  onehourphoto
+  marketplace
+  shoplist
+  mp
+  mpomsff
+  stresstest
+
+=cut
+
+sub get_options{
+
+    GetOptions(\my %opt, qw{
+        help|h 
+        debug|d=i
+        operation|o=s@
+        file|f=s
+    });
+    pod2usage(-verbose => 2) and exit 0 if $opt{help};
+
+    # validation
+    if ($opt{file}) {
+        die "Option Error: Config file[$opt{file}] not found!"
+            if not -e $opt{file};
+    } elsif (exists $opt{operation}) {
+        my %kk = map { $_ => undef } @{$param->{operations}};
+        for my $op (@{ $opt{operation} }){
+            die "Option Error: '$op' is not a valid parameter.\n\n Use -help to find more details\n"
+                if not exists $kk{$op};
+        }
+    } else {
+        die "Option Missing: parameter 'operation' is needed.\n Use -help to find more details\n";
+    }
+
+    return \%opt;
+}

@@ -1,0 +1,27 @@
+<body>
+<mq>
+  <server>sdc-sbob1-e6</server>
+  <port>1414</port>
+  <queuemgr>BEDROCK.DMZ.QUEUEMGR</queuemgr>
+  <channel>BEDROCK.DMZ.CHANNEL</channel>
+  <transporttype>TCP</transporttype>
+  <maxlength>16777216</maxlength>
+  <queue>stresstest</queue>
+  <queue>orderconfirm</queue>
+</mq>
+<config mode="enqueue">
+  <default isatest="N" enable="N">
+    <file length="10000">wm_mail/template/mail_content_email_5</file>
+    <count>20000</count>
+    <thread>4</thread>
+    <persec>5</persec>
+  </default>
+  <operation name="stresstest" isatest="Y" enable="Y">
+    <file length="20000">wm_mail/template/mail_content_email_5</file>
+    <count>1000</count>
+    <thread>10</thread>
+    <persec>10</persec>
+  </operation>
+
+</config>
+</body>
